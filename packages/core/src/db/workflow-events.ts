@@ -21,6 +21,8 @@ import {
   type NodeStateEventType,
   type NodeLifecycleEventType,
   type DagResumeSnapshot,
+  type IterationWorktreeBinding,
+  type LoopIterationProgress,
   type PersistedNodeOutput,
   type WorkflowEventInput,
   type ObservabilityEventInput,
@@ -404,18 +406,34 @@ export async function listActiveWorkflowNodeIds(
 export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagResumeSnapshot> {
   const result = await pool.query<{
     step_name: string | null;
-    event_type: NodeStateEventType | 'fan_out_instances';
+    event_type:
+      | NodeStateEventType
+      | 'fan_out_instances'
+      | 'loop_iteration_started'
+      | 'loop_iteration_completed'
+      | 'iteration_worktree_bound';
     data: string | Record<string, unknown>;
   }>(
     `SELECT step_name, event_type, data FROM remote_agent_workflow_events
      WHERE workflow_run_id = $1 AND event_type IN (${NODE_STATE_EVENT_TYPES.map(
        (_, index) => `$${String(index + 2)}`
-     ).join(', ')}, $${String(NODE_STATE_EVENT_TYPES.length + 2)})
+     ).join(
+       ', '
+     )}, $${String(NODE_STATE_EVENT_TYPES.length + 2)}, $${String(NODE_STATE_EVENT_TYPES.length + 3)}, $${String(NODE_STATE_EVENT_TYPES.length + 4)}, $${String(NODE_STATE_EVENT_TYPES.length + 5)})
      ORDER BY created_at ASC, COALESCE(event_order, 0) ASC, id ASC`,
-    [workflowRunId, ...NODE_STATE_EVENT_TYPES, 'fan_out_instances']
+    [
+      workflowRunId,
+      ...NODE_STATE_EVENT_TYPES,
+      'fan_out_instances',
+      'loop_iteration_started',
+      'loop_iteration_completed',
+      'iteration_worktree_bound',
+    ]
   );
   const completedNodeOutputs = new Map<string, PersistedNodeOutput>();
   const fanOutSnapshots = new Map<string, readonly FanOutInstanceSnapshot[]>();
+  const iterationWorktrees = new Map<string, IterationWorktreeBinding>();
+  const loopIterationProgress = new Map<string, LoopIterationProgress>();
   const unresolvedNodeStarts = new Set<string>();
   // Collected and merged once at the end rather than folded pairwise: a pairwise fold
   // cannot tell "one of five contributions reported" from "one of two" (#2662).
@@ -423,7 +441,12 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
   const authoritativeInstanceScopes = new Set<string>();
   for (const row of result.rows) {
     if (!row.step_name) continue;
-    if (row.event_type !== 'fan_out_instances') {
+    if (
+      row.event_type !== 'fan_out_instances' &&
+      row.event_type !== 'loop_iteration_started' &&
+      row.event_type !== 'loop_iteration_completed' &&
+      row.event_type !== 'iteration_worktree_bound'
+    ) {
       foldActiveNodeIds(unresolvedNodeStarts, row.step_name, row.event_type);
       // Every later node state supersedes reusable success, even when that row
       // carries no output (or its data cannot be recovered). Only success restores it.
@@ -444,6 +467,60 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
         const snapshots = parseFanOutSnapshots(data.instances);
         if (snapshots !== undefined) fanOutSnapshots.set(row.step_name, snapshots);
       }
+      continue;
+    }
+    if (row.event_type === 'loop_iteration_started') {
+      const prior = loopIterationProgress.get(row.step_name) ?? { started: 0, completed: 0 };
+      if (typeof data.iteration !== 'number' || data.iteration < 1)
+        throw new Error(`Invalid loop iteration start for ${row.step_name}`);
+      loopIterationProgress.set(row.step_name, {
+        started: data.iteration,
+        completed: prior.completed,
+      });
+      const prefix = `${row.step_name}.`;
+      for (const key of loopIterationProgress.keys()) {
+        if (key.startsWith(prefix)) loopIterationProgress.delete(key);
+      }
+      for (const key of completedNodeOutputs.keys()) {
+        if (key.startsWith(prefix)) completedNodeOutputs.delete(key);
+      }
+      for (const key of unresolvedNodeStarts) {
+        if (key.startsWith(prefix)) unresolvedNodeStarts.delete(key);
+      }
+      continue;
+    }
+    if (row.event_type === 'loop_iteration_completed') {
+      const prior = loopIterationProgress.get(row.step_name) ?? { started: 0, completed: 0 };
+      if (typeof data.iteration !== 'number' || data.iteration < 1)
+        throw new Error(`Invalid loop iteration completion for ${row.step_name}`);
+      loopIterationProgress.set(row.step_name, {
+        ...prior,
+        completed: data.iteration,
+        ...(typeof data.completionDetected === 'boolean'
+          ? { completionDetected: data.completionDetected }
+          : {}),
+      });
+      continue;
+    }
+    if (row.event_type === 'iteration_worktree_bound') {
+      const binding = data as Partial<IterationWorktreeBinding>;
+      if (
+        binding.groupPath !== row.step_name ||
+        typeof binding.iteration !== 'number' ||
+        typeof binding.cwd !== 'string' ||
+        typeof binding.branchName !== 'string' ||
+        typeof binding.envId !== 'string' ||
+        typeof binding.baseSha !== 'string' ||
+        typeof binding.targetRef !== 'string' ||
+        typeof binding.sourceDigest !== 'string'
+      )
+        throw new Error(`Invalid iteration worktree binding for ${row.step_name}`);
+      const key = `${binding.groupPath}:${binding.iteration}`;
+      const previous = iterationWorktrees.get(key);
+      if (previous && JSON.stringify(previous) !== JSON.stringify(binding)) {
+        throw new Error(`Conflicting iteration worktree bindings for ${key}`);
+      }
+      iterationWorktrees.set(key, binding as IterationWorktreeBinding);
       continue;
     }
     if (
@@ -618,6 +695,8 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
   return {
     completedNodeOutputs,
     fanOutSnapshots,
+    iterationWorktrees,
+    loopIterationProgress,
     unresolvedNodeStarts,
     tokens: mergeTokenUsage(
       countedUsage.flatMap(contribution =>

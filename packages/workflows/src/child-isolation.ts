@@ -63,4 +63,26 @@ export interface ChildIsolationResult {
  */
 export interface ChildIsolationResolver {
   resolve(req: ChildIsolationRequest): Promise<ChildIsolationResult>;
+  resolveIteration?: IterationIsolationResolver['resolve'];
+}
+
+export interface IterationWorktreeBinding {
+  groupPath: string;
+  iteration: number;
+  cwd: string;
+  branchName: string;
+  envId: string;
+  baseSha: string;
+  targetRef: string;
+  sourceDigest: string;
+}
+
+export interface IterationIsolationResolver {
+  resolve(req: {
+    parentRun: WorkflowRun;
+    groupPath: string;
+    iteration: number;
+    sourceDigest: string;
+    recorded?: IterationWorktreeBinding;
+  }): Promise<IterationWorktreeBinding>;
 }

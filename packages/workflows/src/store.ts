@@ -19,6 +19,8 @@ import type {
 } from './schemas';
 import type { TokenUsage } from '@archon/providers/types';
 import type { FanOutInstanceSnapshot } from './fan-out-identity';
+import type { IterationWorktreeBinding } from './child-isolation';
+export type { IterationWorktreeBinding } from './child-isolation';
 
 export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 
@@ -45,11 +47,19 @@ export interface DagResumeSnapshot {
   completedNodeOutputs: Map<string, PersistedNodeOutput>;
   /** First durable ordered snapshot for each instance-qualified composed fan-out scope. */
   fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
+  iterationWorktrees?: Map<string, IterationWorktreeBinding>;
+  loopIterationProgress?: Map<string, LoopIterationProgress>;
   /** Node/instance starts with no later terminal event, in lifecycle order. */
   unresolvedNodeStarts: Set<string>;
   tokens?: TokenUsage;
   /** Cumulative USD cost persisted by completed and failed node attempts across prior passes. */
   costUsd: number;
+}
+
+export interface LoopIterationProgress {
+  started: number;
+  completed: number;
+  completionDetected?: boolean;
 }
 
 /** Durable wait outcome committed atomically with consumption of its active cursor. */
@@ -62,7 +72,12 @@ export type WorkflowWaitPause = { kind: 'started'; stepName: string } | { kind: 
 
 /** Exact persisted cursor expected by an automatic continuation claim. */
 export type WorkflowResumeCursor =
-  | { kind: 'wait'; nodeId: string; resumeAt: string }
+  | {
+      kind: 'wait';
+      nodeId: string;
+      resumeAt: string;
+      ancestry?: Extract<WorkflowWaitContext, { owner: 'loop_group' }>['ancestry'];
+    }
   | { kind: 'quota'; attempt: number; resumeAt: string };
 
 /** Composite primary key identifying a single persisted node session row. */
@@ -170,6 +185,7 @@ export const WORKFLOW_EVENT_TYPES = [
   // #2512 — audit snapshot of a composed fan-out's ordered instance set (identity +
   // item per ordinal), written before the first instance schedules.
   'fan_out_instances',
+  'iteration_worktree_bound',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

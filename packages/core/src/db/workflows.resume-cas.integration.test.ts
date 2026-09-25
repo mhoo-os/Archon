@@ -1080,6 +1080,81 @@ describe('durable wait continuation races — real SQLite', () => {
     expect(await countEvents('wait-signal-cursor', 'wait_signaled')).toBe(0);
   });
 
+  test('nested ancestry rejects a stale signal and deadline with the same event and timestamp', async () => {
+    const first = {
+      ...waitA,
+      nodeId: 'inner',
+      bodyWaitId: 'checks',
+      ancestry: {
+        version: 1 as const,
+        frames: [
+          { groupId: 'issues', iteration: 1 },
+          { groupId: 'inner', iteration: 1 },
+        ],
+      },
+    };
+    const second = {
+      ...first,
+      ancestry: {
+        version: 1 as const,
+        frames: [
+          { groupId: 'issues', iteration: 2 },
+          { groupId: 'inner', iteration: 1 },
+        ],
+      },
+    };
+    await seed('nested-wait-cursor', 'paused', "datetime('now')", { wait: second });
+    const retryAt = '2026-08-24T10:03:00.000Z';
+    await deferWorkflowContinuation('nested-wait-cursor', retryAt, {
+      kind: 'wait',
+      nodeId: first.nodeId,
+      resumeAt: first.resumeAt,
+      ancestry: first.ancestry,
+    });
+    expect(
+      (await getWorkflowRun('nested-wait-cursor'))?.metadata.continuation_retry_at
+    ).toBeUndefined();
+    await deferWorkflowContinuation('nested-wait-cursor', retryAt, {
+      kind: 'wait',
+      nodeId: second.nodeId,
+      resumeAt: second.resumeAt,
+      ancestry: second.ancestry,
+    });
+    expect((await getWorkflowRun('nested-wait-cursor'))?.metadata.continuation_retry_at).toBe(
+      retryAt
+    );
+    await expect(signalWorkflowWait('nested-wait-cursor', first)).resolves.toEqual({
+      signaled: false,
+    });
+    await expect(
+      resumeWorkflowRun('nested-wait-cursor', {
+        kind: 'wait',
+        nodeId: first.nodeId,
+        resumeAt: first.resumeAt,
+        ancestry: first.ancestry,
+      })
+    ).rejects.toThrow();
+    expect((await getWorkflowRun('nested-wait-cursor'))?.metadata.wait).toEqual(second);
+    await expect(signalWorkflowWait('nested-wait-cursor', second)).resolves.toEqual({
+      signaled: true,
+    });
+    await expect(
+      resumeWorkflowRun('nested-wait-cursor', {
+        kind: 'wait',
+        nodeId: second.nodeId,
+        resumeAt: second.resumeAt,
+        ancestry: second.ancestry,
+      })
+    ).resolves.toMatchObject({ status: 'running' });
+    await expect(
+      clearWorkflowWaitContext('nested-wait-cursor', first, {
+        stepName: 'issues.inner.checks',
+        result: { status: 'satisfied', waited_ms: 1 },
+      })
+    ).resolves.toEqual({ cleared: false });
+    expect((await getWorkflowRun('nested-wait-cursor'))?.metadata.wait).toMatchObject(second);
+  });
+
   test('gives one resume competitor ownership and leaves every loser side effect free', async () => {
     await seed('wait-three-way-race', 'paused', "datetime('now')", {
       wait: waitA,

@@ -774,7 +774,8 @@ const GATE_ON_A_SHELL_NODE =
  */
 export function validateDagStructure(
   nodes: readonly (DagNode | IncludeDirective)[],
-  enclosingNodes?: ReadonlyMap<string, DagNode | IncludeDirective>
+  enclosingNodes?: ReadonlyMap<string, DagNode | IncludeDirective>,
+  insideIterationWorktree = false
 ): string | null {
   // Check ID uniqueness
   const nodesById = new Map<string, DagNode | IncludeDirective>();
@@ -1151,17 +1152,18 @@ export function validateDagStructure(
       if (misplacedWait) {
         return `loop_group '${node.id}' body: wait node '${misplacedWait.id}' must be the body's sole terminal sink`;
       }
-      const nestedWaitGroup = node.loop_group.nodes.find(
-        n => !isIncludeDirective(n) && isLoopGroupNode(n) && hasDurableWait(n)
-      );
-      if (nestedWaitGroup) {
-        return `loop_group '${node.id}' body: wait nodes nested below another loop_group are not supported`;
+      if (insideIterationWorktree && node.loop_group.iteration_worktree) {
+        return `loop_group '${node.id}': nested iteration_worktree scopes are not supported`;
       }
       const scopeNodes = new Map<string, DagNode | IncludeDirective>([
         ...(enclosingNodes ?? []),
         ...nodesById,
       ]);
-      const bodyError = validateDagStructure(node.loop_group.nodes, scopeNodes);
+      const bodyError = validateDagStructure(
+        node.loop_group.nodes,
+        scopeNodes,
+        insideIterationWorktree || node.loop_group.iteration_worktree === true
+      );
       if (bodyError) {
         return `loop_group '${node.id}' body: ${bodyError}`;
       }

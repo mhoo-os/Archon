@@ -22,6 +22,7 @@ import type {
   ChildIsolationResult,
 } from '@archon/workflows/executor';
 import { createHash } from 'node:crypto';
+import { realpath } from 'node:fs/promises';
 import {
   getIsolationProvider,
   configureIsolation,
@@ -31,6 +32,7 @@ import * as git from '@archon/git';
 import { createLogger } from '@archon/paths';
 import { loadRepoConfig } from '../config/config-loader';
 import * as isolationDb from '../db/isolation-environments';
+import type { IterationWorktreeBinding } from '@archon/workflows/store';
 
 /**
  * How much of the node id goes into the branch name verbatim. `WorktreeProvider`
@@ -126,6 +128,15 @@ function getLog(): ReturnType<typeof createLogger> {
   return cachedLog;
 }
 
+async function sameWorktreePath(left: string | undefined, right: string): Promise<boolean> {
+  if (!left) return false;
+  try {
+    return (await realpath(left)) === (await realpath(right));
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Build a {@link ChildIsolationResolver} bound to one codebase. `resolve()` creates
  * a per-child worktree + branch (`archon/task-<parent>-<node>-<hash>-child-<i>`) and registers it.
@@ -160,6 +171,170 @@ export function createChildWorktreeResolver(
   });
 
   return {
+    async resolveIteration(req): Promise<IterationWorktreeBinding> {
+      if (req.parentRun.codebase_id && req.parentRun.codebase_id !== config.codebaseId) {
+        throw new Error(
+          `Iteration resolver bound to codebase '${config.codebaseId}' but run '${req.parentRun.id}' belongs to '${req.parentRun.codebase_id}'`
+        );
+      }
+      if (!config.baseBranch) {
+        throw new Error('Iteration worktrees require an explicit target branch');
+      }
+      const identifier = buildChildIdentifier(req.parentRun.id, req.groupPath, req.iteration);
+      const expectedBranch = `archon/task-${identifier}`;
+      const targetRef = config.baseBranch;
+      const existingEnv = await isolationDb.findActiveByWorkflow(
+        config.codebaseId,
+        'task',
+        identifier
+      );
+      const branchWorktree = (
+        await git.listWorktrees(git.toRepoPath(config.canonicalRepoPath))
+      ).find(worktree => worktree.branch === expectedBranch);
+      const branchPathMatches = await sameWorktreePath(
+        branchWorktree?.path,
+        req.recorded?.cwd ?? existingEnv?.working_path ?? ''
+      );
+
+      if (req.recorded) {
+        const recorded = req.recorded;
+        if (!existingEnv) {
+          throw new Error(
+            `Iteration estate ${req.groupPath}:${req.iteration} has missing or moved ownership evidence`
+          );
+        }
+        if (
+          recorded.groupPath !== req.groupPath ||
+          recorded.iteration !== req.iteration ||
+          recorded.sourceDigest !== req.sourceDigest ||
+          recorded.targetRef !== targetRef ||
+          recorded.branchName !== expectedBranch ||
+          existingEnv.working_path !== recorded.cwd ||
+          existingEnv.branch_name !== recorded.branchName ||
+          existingEnv.id !== recorded.envId ||
+          existingEnv.metadata.parent_run_id !== req.parentRun.id ||
+          existingEnv.metadata.group_path !== req.groupPath ||
+          existingEnv.metadata.iteration !== req.iteration ||
+          existingEnv.metadata.base_sha !== recorded.baseSha ||
+          existingEnv.metadata.source_digest !== req.sourceDigest ||
+          !branchPathMatches
+        ) {
+          throw new Error(
+            `Iteration estate ${req.groupPath}:${req.iteration} has missing or moved ownership evidence`
+          );
+        }
+        await git.verifyWorktreeOwnership(
+          git.toWorktreePath(recorded.cwd),
+          git.toRepoPath(config.canonicalRepoPath)
+        );
+        const actualBranch = await git.getCurrentBranchStrict(git.toWorktreePath(recorded.cwd));
+        if (actualBranch !== recorded.branchName) {
+          throw new Error(`Iteration estate ${req.groupPath}:${req.iteration} changed branch`);
+        }
+        await git.execFileAsync('git', [
+          '-C',
+          recorded.cwd,
+          'merge-base',
+          '--is-ancestor',
+          recorded.baseSha,
+          'HEAD',
+        ]);
+        return recorded;
+      }
+
+      if (
+        existingEnv &&
+        (!branchPathMatches ||
+          existingEnv.branch_name !== expectedBranch ||
+          existingEnv.metadata.parent_run_id !== req.parentRun.id ||
+          existingEnv.metadata.group_path !== req.groupPath ||
+          existingEnv.metadata.iteration !== req.iteration ||
+          existingEnv.metadata.source_digest !== req.sourceDigest)
+      ) {
+        throw new Error(
+          `Iteration estate ${req.groupPath}:${req.iteration} has ambiguous registered ownership`
+        );
+      }
+
+      const provider = getIsolationProvider();
+      const isolatedEnv = await provider.create({
+        workflowType: 'task',
+        identifier,
+        baseOverride: git.toBranchName(targetRef),
+        codebaseId: config.codebaseId,
+        codebaseName: config.codebaseName,
+        canonicalRepoPath: git.toRepoPath(config.canonicalRepoPath),
+        description: `iteration ${String(req.iteration)} of ${req.groupPath}`,
+      });
+      if (
+        isolatedEnv.branchName !== expectedBranch ||
+        (branchWorktree && !(await sameWorktreePath(branchWorktree.path, isolatedEnv.workingPath)))
+      ) {
+        throw new Error(
+          `Iteration estate ${req.groupPath}:${req.iteration} has a conflicting branch or path`
+        );
+      }
+      await git.verifyWorktreeOwnership(
+        git.toWorktreePath(isolatedEnv.workingPath),
+        git.toRepoPath(config.canonicalRepoPath)
+      );
+      if (
+        (await git.getCurrentBranchStrict(git.toWorktreePath(isolatedEnv.workingPath))) !==
+        isolatedEnv.branchName
+      ) {
+        throw new Error(`Iteration estate ${req.groupPath}:${req.iteration} changed branch`);
+      }
+      if (isolatedEnv.metadata.adopted && !existingEnv) {
+        const status = await git.execFileAsync('git', [
+          '-C',
+          isolatedEnv.workingPath,
+          'status',
+          '--porcelain',
+        ]);
+        if (status.stdout.trim()) {
+          throw new Error(
+            `Iteration estate ${req.groupPath}:${req.iteration} is unrecorded and dirty; reconcile it explicitly`
+          );
+        }
+      }
+      const baseSha = (
+        await git.execFileAsync('git', ['-C', isolatedEnv.workingPath, 'rev-parse', 'HEAD'])
+      ).stdout.trim();
+      const envRecord =
+        existingEnv ??
+        (await isolationDb.create({
+          codebase_id: config.codebaseId,
+          workflow_type: 'task',
+          workflow_id: identifier,
+          provider: 'worktree',
+          working_path: isolatedEnv.workingPath,
+          branch_name: isolatedEnv.branchName,
+          created_by_platform: config.createdByPlatform,
+          ...(config.createdByUserId ? { created_by_user_id: config.createdByUserId } : {}),
+          metadata: {
+            parent_run_id: req.parentRun.id,
+            group_path: req.groupPath,
+            iteration: req.iteration,
+            base_sha: baseSha,
+            source_digest: req.sourceDigest,
+          },
+        }));
+      if (existingEnv && existingEnv.metadata.base_sha !== baseSha) {
+        throw new Error(
+          `Iteration estate ${req.groupPath}:${req.iteration} changed base before binding`
+        );
+      }
+      return {
+        groupPath: req.groupPath,
+        iteration: req.iteration,
+        cwd: isolatedEnv.workingPath,
+        branchName: isolatedEnv.branchName,
+        envId: envRecord.id,
+        baseSha,
+        targetRef,
+        sourceDigest: req.sourceDigest,
+      };
+    },
     async resolve(req: ChildIsolationRequest): Promise<ChildIsolationResult> {
       const childIndex = req.childIndex ?? 0;
 

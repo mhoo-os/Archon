@@ -522,6 +522,7 @@ export type LoopNode = z.infer<typeof loopNodeSchema>;
  * as real DagNodes — including nested loop_groups.
  */
 export type LoopGroupNodeConfig = LoopControl & {
+  iteration_worktree?: boolean;
   /**
    * Sub-DAG body re-executed in full each iteration. At least one node required.
    * Widened to admit `IncludeDirective` because `dagNodeSchema` (below) parses to
@@ -533,6 +534,7 @@ export type LoopGroupNodeConfig = LoopControl & {
 };
 export const loopGroupNodeConfigSchema: z.ZodType<LoopGroupNodeConfig> = loopControlSchema
   .extend({
+    iteration_worktree: z.boolean().optional(),
     /** Sub-DAG body re-executed in full each iteration. At least one node required. */
     get nodes(): z.ZodArray<typeof dagNodeSchema> {
       return z.array(dagNodeSchema).min(1, "'loop_group.nodes' must have at least one node");

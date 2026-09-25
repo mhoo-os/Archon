@@ -352,6 +352,61 @@ describe('workflow-events', () => {
   });
 
   describe('getDagResumeSnapshot', () => {
+    test('keeps only the active outer iteration and resets nested progress', async () => {
+      const binding = {
+        groupPath: 'outer',
+        iteration: 2,
+        cwd: '/worktrees/b',
+        branchName: 'issue-b',
+        envId: 'env-b',
+        baseSha: 'a'.repeat(40),
+        targetRef: 'dev',
+        sourceDigest: 'capture',
+      };
+      mockQuery.mockResolvedValueOnce(
+        createQueryResult([
+          { step_name: 'outer', event_type: 'loop_iteration_started', data: { iteration: 1 } },
+          {
+            step_name: 'outer.inner',
+            event_type: 'loop_iteration_started',
+            data: { iteration: 1 },
+          },
+          {
+            step_name: 'outer.inner.before',
+            event_type: 'node_completed',
+            data: { node_output: 'A' },
+          },
+          {
+            step_name: 'outer.inner',
+            event_type: 'loop_iteration_completed',
+            data: { iteration: 1 },
+          },
+          { step_name: 'outer', event_type: 'loop_iteration_completed', data: { iteration: 1 } },
+          { step_name: 'outer', event_type: 'loop_iteration_started', data: { iteration: 2 } },
+          { step_name: 'outer', event_type: 'iteration_worktree_bound', data: binding },
+          {
+            step_name: 'outer.inner',
+            event_type: 'loop_iteration_started',
+            data: { iteration: 1 },
+          },
+          {
+            step_name: 'outer.inner.before',
+            event_type: 'node_completed',
+            data: { node_output: 'B' },
+          },
+        ])
+      );
+
+      const snapshot = await getDagResumeSnapshot('run-b');
+      expect(snapshot.completedNodeOutputs.get('outer.inner.before')).toEqual({ output: 'B' });
+      expect(snapshot.loopIterationProgress?.get('outer')).toEqual({ started: 2, completed: 1 });
+      expect(snapshot.loopIterationProgress?.get('outer.inner')).toEqual({
+        started: 1,
+        completed: 0,
+      });
+      expect(snapshot.iterationWorktrees?.get('outer:2')).toEqual(binding);
+    });
+
     test('returns outputs and summed tokens from node_completed events', async () => {
       mockQuery.mockResolvedValueOnce(
         createQueryResult([

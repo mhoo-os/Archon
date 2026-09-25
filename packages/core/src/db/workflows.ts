@@ -93,6 +93,23 @@ function rowLockClause(): string {
   return getDatabaseType() === 'postgresql' ? ' FOR UPDATE' : '';
 }
 
+function waitAncestryMatch(
+  wait: WorkflowWaitContext,
+  parameterIndex: number
+): { clause: string; params: unknown[] } {
+  const expr =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->'ancestry'"
+      : "json_extract(metadata, '$.wait.ancestry')";
+  if (wait.owner !== 'loop_group' || wait.ancestry === undefined) {
+    return { clause: `${expr} IS NULL`, params: [] };
+  }
+  return {
+    clause: `${expr} = $${parameterIndex}${getDatabaseType() === 'postgresql' ? '::jsonb' : ''}`,
+    params: [JSON.stringify(wait.ancestry)],
+  };
+}
+
 function parseJsonObject(raw: unknown): Record<string, unknown> | null {
   let value = raw;
   if (typeof value === 'string') {
@@ -920,7 +937,10 @@ export async function resumeWorkflowRun(
               isWorkflowWaitContext(priorMetadata.wait) &&
               priorMetadata.wait.kind !== 'attention' &&
               priorMetadata.wait.nodeId === cursor.nodeId &&
-              priorMetadata.wait.resumeAt === cursor.resumeAt
+              priorMetadata.wait.resumeAt === cursor.resumeAt &&
+              JSON.stringify(
+                priorMetadata.wait.owner === 'loop_group' ? priorMetadata.wait.ancestry : undefined
+              ) === JSON.stringify(cursor.ancestry)
             : prior?.status === 'failed' &&
               isScheduledWorkflowResume(priorMetadata.scheduled_resume) &&
               priorMetadata.scheduled_resume.triggeredAt === undefined &&
@@ -1487,6 +1507,9 @@ export async function failPausedAttentionWait(
       : "json_extract(metadata, '$.wait.iteration')";
     ownerClauses.push(`${waitField('bodyWaitId')} = $5`, `${iterationField} = $6`);
   }
+  const ancestry = waitAncestryMatch(parsedWaitContext, params.length + 1);
+  ownerClauses.push(ancestry.clause);
+  params.push(...ancestry.params);
   const metadataWithoutScheduledResume = postgres
     ? "metadata - 'scheduled_resume'"
     : "json_remove(metadata, '$.scheduled_resume')";
@@ -1538,13 +1561,15 @@ export async function clearWorkflowWaitContext(
   const cursor = waitContext.kind === 'attention' ? waitContext.waitingSince : waitContext.resumeAt;
   const clearWait =
     getDatabaseType() === 'postgresql' ? "metadata - 'wait'" : "json_remove(metadata, '$.wait')";
+  const ancestry = waitAncestryMatch(waitContext, 4);
   try {
     return await getDatabase().withTransaction(async query => {
       const result = await query(
         `UPDATE remote_agent_workflow_runs
          SET metadata = ${clearWait}
-         WHERE id = $1 AND status = 'running' AND ${nodeExpr} = $2 AND ${cursorExpr} = $3`,
-        [id, waitContext.nodeId, cursor]
+         WHERE id = $1 AND status = 'running' AND ${nodeExpr} = $2 AND ${cursorExpr} = $3
+           AND ${ancestry.clause}`,
+        [id, waitContext.nodeId, cursor, ...ancestry.params]
       );
       if ((result.rowCount ?? 0) === 0) return { cleared: false };
       const rows = waitCompletionEvents(id, completion);
@@ -1720,11 +1745,20 @@ export async function deferWorkflowContinuation(
     getDatabaseType() === 'postgresql'
       ? "(metadata->'scheduled_resume'->>'attempt')::integer"
       : "json_extract(metadata, '$.scheduled_resume.attempt')";
+  const waitAncestry =
+    getDatabaseType() === 'postgresql'
+      ? "metadata->'wait'->'ancestry'"
+      : "json_extract(metadata, '$.wait.ancestry')";
+  const ancestryClause =
+    cursor.kind === 'wait' && cursor.ancestry !== undefined
+      ? `${waitAncestry} = $6${getDatabaseType() === 'postgresql' ? '::jsonb' : ''}`
+      : `${waitAncestry} IS NULL`;
   try {
     await pool.query(
       `UPDATE remote_agent_workflow_runs
        SET metadata = ${dialect.jsonMerge('metadata', 2)}
-       WHERE id = $1 AND ((status = 'paused' AND ${waitResumeAt} = $3 AND ${waitNodeId} = $4)
+       WHERE id = $1 AND ((status = 'paused' AND ${waitResumeAt} = $3 AND ${waitNodeId} = $4
+         AND ${ancestryClause})
          OR (status = 'failed' AND ${scheduledResumeAt} = $3
            AND ${scheduledTriggeredAt} IS NULL AND ${scheduledAttempt} = $5))`,
       [
@@ -1733,6 +1767,9 @@ export async function deferWorkflowContinuation(
         cursor.resumeAt,
         cursor.kind === 'wait' ? cursor.nodeId : null,
         cursor.kind === 'quota' ? cursor.attempt : null,
+        ...(cursor.kind === 'wait' && cursor.ancestry !== undefined
+          ? [JSON.stringify(cursor.ancestry)]
+          : []),
       ]
     );
   } catch (error) {
@@ -1769,6 +1806,7 @@ export async function signalWorkflowWait(
       ? "metadata->'wait'->>'resumeAt'"
       : "json_extract(metadata, '$.wait.resumeAt')";
   const signaledAt = new Date().toISOString();
+  const ancestry = waitAncestryMatch(parsedWaitContext, payload === undefined ? 6 : 7);
   const metadataWrite =
     payload === undefined
       ? getDatabaseType() === 'postgresql'
@@ -1784,7 +1822,8 @@ export async function signalWorkflowWait(
          SET metadata = ${metadataWrite}
          WHERE id = $1 AND status = 'paused' AND ${eventExpr} = $2
            AND ${nodeExpr} = $3 AND ${resumeAtExpr} = $4
-           AND ${signaledExpr} IS NULL AND ${resumeAtExpr} > $5`,
+           AND ${signaledExpr} IS NULL AND ${resumeAtExpr} > $5
+           AND ${ancestry.clause}`,
         payload === undefined
           ? [
               id,
@@ -1792,6 +1831,7 @@ export async function signalWorkflowWait(
               parsedWaitContext.nodeId,
               parsedWaitContext.resumeAt,
               signaledAt,
+              ...ancestry.params,
             ]
           : [
               id,
@@ -1800,6 +1840,7 @@ export async function signalWorkflowWait(
               parsedWaitContext.resumeAt,
               signaledAt,
               JSON.stringify(payload),
+              ...ancestry.params,
             ]
       );
       const signaled = (result.rowCount ?? 0) > 0;

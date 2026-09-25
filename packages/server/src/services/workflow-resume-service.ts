@@ -30,6 +30,9 @@ function continuationCursor(run: WorkflowRun): WorkflowResumeCursor | undefined 
       kind: 'wait',
       nodeId: run.metadata.wait.nodeId,
       resumeAt: run.metadata.wait.resumeAt,
+      ...(run.metadata.wait.owner === 'loop_group' && run.metadata.wait.ancestry
+        ? { ancestry: run.metadata.wait.ancestry }
+        : {}),
     };
   }
   if (run.status === 'failed' && isScheduledWorkflowResume(run.metadata.scheduled_resume)) {

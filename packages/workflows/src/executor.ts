@@ -3127,6 +3127,7 @@ export async function executeWorkflow(
             effectiveRunConfig,
             resolveChildIsolation
           ),
+        resolveIterationIsolation: resolveChildIsolation?.resolveIteration,
         priorUsage: dagPriorUsage,
         priorNodeSessions,
         // Container runs resolve from the capture like every other run: it is bind-mounted

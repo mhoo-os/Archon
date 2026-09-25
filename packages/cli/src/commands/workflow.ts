@@ -123,6 +123,7 @@ import {
   workflowRunStatusSchema,
   isApprovalContext,
   isWorkflowWaitContext,
+  type WorkflowWaitContext,
   workflowWaitStepName,
   isScheduledWorkflowResume,
   skipCauseSchema,
@@ -3509,6 +3510,7 @@ export interface DurableWaitCursor {
   stepName: string;
   resumeAt: string;
   signaled: boolean;
+  ancestry?: Extract<WorkflowWaitContext, { owner: 'loop_group' }>['ancestry'];
 }
 
 /** A run this process should resume itself once its wait's deadline arrives. */
@@ -3537,6 +3539,7 @@ export function pendingDurableWait(run: WorkflowRun): DurableWaitCursor | undefi
     stepName: workflowWaitStepName(wait),
     resumeAt: wait.resumeAt,
     signaled: wait.kind === 'event' && wait.signaledAt !== undefined,
+    ...(wait.owner === 'loop_group' && wait.ancestry ? { ancestry: wait.ancestry } : {}),
   };
 }
 
@@ -3566,7 +3569,11 @@ async function awaitDurableWaitDeadline(
     );
     const latest = await workflowDb.getWorkflowRun(runId);
     const next = latest === null ? undefined : pendingDurableWait(latest);
-    if (next?.stepName !== cursor.stepName || next.resumeAt !== cursor.resumeAt) {
+    if (
+      next?.stepName !== cursor.stepName ||
+      next.resumeAt !== cursor.resumeAt ||
+      JSON.stringify(next.ancestry) !== JSON.stringify(cursor.ancestry)
+    ) {
       return 'stop';
     }
     cursor = next;
