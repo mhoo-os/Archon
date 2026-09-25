@@ -3019,7 +3019,7 @@ nodes:
       ).toBe(true);
     });
 
-    it('rejects waits nested below more than one loop_group boundary', () => {
+    it('allows a serial wait inside nested loop groups', () => {
       const result = parseWorkflow(
         `
 name: nested-wait
@@ -3042,9 +3042,69 @@ nodes:
         '/tmp/nested-wait.yaml'
       );
 
-      expect(result.error?.error).toContain(
-        'wait nodes nested below another loop_group are not supported'
+      expect(result.error).toBeNull();
+    });
+
+    it('rejects competing nested wait paths', () => {
+      const result = parseWorkflow(
+        `
+name: competing-waits
+description: competing waits
+nodes:
+  - id: outer
+    loop_group:
+      max_iterations: 2
+      until_bash: exit 0
+      nodes:
+        - id: first
+          loop_group:
+            max_iterations: 2
+            until_bash: exit 0
+            nodes:
+              - id: wait-a
+                wait: { duration_ms: 1000 }
+        - id: second
+          loop_group:
+            max_iterations: 2
+            until_bash: exit 0
+            nodes:
+              - id: wait-b
+                wait: { duration_ms: 1000 }
+`,
+        '/tmp/competing-waits.yaml'
       );
+      expect(result.error?.error).toContain('can run concurrently');
+    });
+
+    it('rejects an isolation scope through an intermediate loop group', () => {
+      const result = parseWorkflow(
+        `
+name: nested-estates
+description: nested estates
+nodes:
+  - id: outer
+    loop_group:
+      iteration_worktree: true
+      max_iterations: 2
+      until_bash: exit 0
+      nodes:
+        - id: intermediate
+          loop_group:
+            max_iterations: 2
+            until_bash: exit 0
+            nodes:
+              - id: inner
+                loop_group:
+                  iteration_worktree: true
+                  max_iterations: 2
+                  until_bash: exit 0
+                  nodes:
+                    - id: work
+                      bash: echo done
+`,
+        '/tmp/nested-estates.yaml'
+      );
+      expect(result.error?.error).toContain('nested iteration_worktree scopes are not supported');
     });
 
     it('should accept a workflow where output refs use valid existing node IDs', async () => {

@@ -6,6 +6,7 @@ import type { TokenUsage } from '@archon/providers/types';
 // Type-only, so the output-ref ↔ schemas edge stays erased (no runtime cycle).
 import type { JsonValue } from '../output-ref';
 import { isAbsolute } from 'path';
+import { nodeArtifactLoopFrameSchema } from './node-artifact';
 
 // ---------------------------------------------------------------------------
 // WorkflowRunStatus
@@ -70,6 +71,12 @@ const workflowWaitLoopOwnerFields = {
   iteration: z.number().int().positive(),
   sessionId: z.string().nullable(),
   sessionProvider: z.string().nullable(),
+  ancestry: z
+    .strictObject({
+      version: z.literal(1),
+      frames: z.array(nodeArtifactLoopFrameSchema.strict()).min(1),
+    })
+    .optional(),
 } as const;
 
 /**
@@ -93,7 +100,10 @@ export function isWorkflowWaitContext(value: unknown): value is WorkflowWaitCont
 }
 
 export function workflowWaitStepName(wait: WorkflowWaitContext): string {
-  return wait.owner === 'loop_group' ? `${wait.nodeId}.${wait.bodyWaitId}` : wait.nodeId;
+  if (wait.owner !== 'loop_group') return wait.nodeId;
+  return wait.ancestry
+    ? `${wait.ancestry.frames.map(frame => frame.groupId).join('.')}.${wait.bodyWaitId}`
+    : `${wait.nodeId}.${wait.bodyWaitId}`;
 }
 
 export const scheduledWorkflowResumeSchema = z

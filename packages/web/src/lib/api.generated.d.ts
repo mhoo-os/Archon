@@ -3820,6 +3820,7 @@ export interface components {
         interactive?: boolean;
         gate_message?: string;
         signal_completes?: boolean;
+        iteration_worktree?: boolean;
         nodes: components['schemas']['DagNode'][];
       };
       approval?: {
@@ -3975,6 +3976,14 @@ export interface components {
           iteration: number;
           sessionId: string | null;
           sessionProvider: string | null;
+          ancestry?: {
+            /** @enum {number} */
+            version: 1;
+            frames: {
+              groupId: string;
+              iteration: number;
+            }[];
+          };
           /** @enum {string} */
           kind: 'time';
           /** Format: date-time */
@@ -3990,6 +3999,14 @@ export interface components {
           iteration: number;
           sessionId: string | null;
           sessionProvider: string | null;
+          ancestry?: {
+            /** @enum {number} */
+            version: 1;
+            frames: {
+              groupId: string;
+              iteration: number;
+            }[];
+          };
           /** @enum {string} */
           kind: 'event';
           /** Format: date-time */
@@ -4009,6 +4026,14 @@ export interface components {
           iteration: number;
           sessionId: string | null;
           sessionProvider: string | null;
+          ancestry?: {
+            /** @enum {number} */
+            version: 1;
+            frames: {
+              groupId: string;
+              iteration: number;
+            }[];
+          };
           /** @enum {string} */
           kind: 'attention';
           /** Format: date-time */

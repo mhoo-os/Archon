@@ -7,6 +7,7 @@
  */
 import { NodeEventWriteError, recordDerivedNodeState, recordNodeState } from './node-event-write';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { createHash } from 'node:crypto';
 import { readFile } from 'fs/promises';
 import { basename, isAbsolute, join as joinPath, resolve as resolvePath, sep } from 'path';
 import { execFileAsync, resolveBashPath } from '@archon/git';
@@ -39,6 +40,7 @@ import type {
 } from '@archon/providers/types';
 import { CONTAINER_ENV_DENYLIST, mergeTokenUsage } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
+import type { IterationIsolationResolver, IterationWorktreeBinding } from './child-isolation';
 import { WRITEBACK_GATE_NODE_ID } from './container-context';
 import {
   getProviderCapabilities,
@@ -105,7 +107,12 @@ import { mapNodeTemplateSlots } from './template-walker';
 import { buildExecNodeEnvironment } from './exec-environment';
 import { planGraph, resolvedBodyNodes } from './graph-plan';
 import { FAN_OUT_CANCEL_REASONS, waitCompletionEvents } from './store';
-import type { DagResumeSnapshot, FanOutCancelReason, PersistedNodeOutput } from './store';
+import type {
+  DagResumeSnapshot,
+  FanOutCancelReason,
+  PendingIterationGate,
+  PersistedNodeOutput,
+} from './store';
 import { formatToolCall } from './utils/tool-formatter';
 import { createLogger, captureWorkflowCompleted } from '@archon/paths';
 import type { WorkflowErrorClass, WorkflowNodeType } from '@archon/paths';
@@ -4565,6 +4572,16 @@ async function executeLoopGroupNode(
   // Body nodes are namespaced under THIS group's (already-namespaced) step name so the
   // prefix composes across nested loop_groups: `<enclosing>.<groupId>.<bodyNodeId>`.
   const bodyStepNamePrefix = `${stepName}.`;
+  const hydrateBodyOutput = (bodyNode: DagNode, prior: PersistedNodeOutput): NodeOutput => ({
+    state: 'completed',
+    output: prior.output,
+    ...(prior.structuredOutput !== undefined ? { structuredOutput: prior.structuredOutput } : {}),
+    ...(prior.declaredFields !== undefined
+      ? { declaredFields: [...prior.declaredFields] }
+      : !isLoopGroupNode(bodyNode)
+        ? { declaredFields: declaredFieldsFromSchema(bodyNode.output_format) }
+        : {}),
+  });
 
   // Static (iteration-invariant) id sets for `$LOOP_PREV.<id>.output[.field]` resolution
   // (#2142). `knownBodyIds` is TRANSITIVE (this group's body + every nested descendant) —
@@ -4589,17 +4606,236 @@ async function executeLoopGroupNode(
   const rawWait = workflowRun.metadata?.wait;
   const loopWaitMeta = isWorkflowWaitContext(rawWait) ? rawWait : undefined;
   const loopOwnedWaitMeta = loopWaitMeta?.owner === 'loop_group' ? loopWaitMeta : undefined;
+  const waitFrames = loopOwnedWaitMeta?.ancestry?.frames;
+  const parentFramesMatch = ctx.loopGroupPath.every(
+    (frame, index) =>
+      waitFrames?.[index]?.groupId === frame.groupId &&
+      waitFrames[index]?.iteration === frame.iteration
+  );
+  const ownWaitFrame = parentFramesMatch ? waitFrames?.[ctx.loopGroupPath.length] : undefined;
+  const waitOwnsGroup =
+    ownWaitFrame?.groupId === node.id ||
+    (waitFrames === undefined &&
+      ctx.loopGroupPath.length === 0 &&
+      loopOwnedWaitMeta?.nodeId === node.id);
   const isLegacyInteractiveLoopResume =
     loopGateMeta?.type === 'interactive_loop' && loopGateMeta.nodeId === node.id;
   const isEscalatedGateResume =
     loopGateMeta?.type === 'approval' &&
     loopGateMeta.nodeId === node.id &&
     loopGateMeta.bodyGateId !== undefined;
-  const isEscalatedWaitResume = loopOwnedWaitMeta?.nodeId === node.id;
+  const isEscalatedWaitResume =
+    waitOwnsGroup &&
+    (waitFrames === undefined || waitFrames.length === ctx.loopGroupPath.length + 1);
+  const isNestedWaitResume =
+    waitOwnsGroup && waitFrames !== undefined && waitFrames.length > ctx.loopGroupPath.length + 1;
   const isLoopResume =
-    isLegacyInteractiveLoopResume || isEscalatedGateResume || isEscalatedWaitResume;
-  const resumeIteration = loopGateMeta?.iteration ?? loopOwnedWaitMeta?.iteration ?? 0;
-  const startIteration = isLoopResume ? resumeIteration + 1 : 1;
+    isLegacyInteractiveLoopResume ||
+    isEscalatedGateResume ||
+    isEscalatedWaitResume ||
+    isNestedWaitResume;
+  const resumeIteration =
+    ownWaitFrame?.iteration ?? loopGateMeta?.iteration ?? loopOwnedWaitMeta?.iteration ?? 0;
+  const snapshot =
+    group.iteration_worktree ||
+    isNestedWaitResume ||
+    (ctx.loopGroupPath.length > 0 && isEscalatedWaitResume)
+      ? await deps.store.getDagResumeSnapshot(workflowRun.id)
+      : undefined;
+  if (snapshot && (isEscalatedWaitResume || isNestedWaitResume)) {
+    for (const bodyNode of bodyNodes) {
+      const prior = snapshot.completedNodeOutputs.get(bodyStepNamePrefix + bodyNode.id);
+      if (!prior) continue;
+      outerNodeOutputs.set(bodyStepNamePrefix + bodyNode.id, hydrateBodyOutput(bodyNode, prior));
+    }
+  }
+  const progress = snapshot?.loopIterationProgress?.get(stepName);
+  const latestBodySink = (): PersistedNodeOutput | undefined => {
+    const dependedOn = new Set(bodyNodes.flatMap(bodyNode => bodyNode.depends_on ?? []));
+    return bodyNodes
+      .filter(bodyNode => !dependedOn.has(bodyNode.id))
+      .map(bodyNode => snapshot?.completedNodeOutputs.get(bodyStepNamePrefix + bodyNode.id))
+      .find(output => output !== undefined && output.output.trim().length > 0);
+  };
+  const recoveryIteration =
+    !isLoopResume && group.iteration_worktree && progress
+      ? progress.started > progress.completed
+        ? progress.started
+        : progress.completed + 1
+      : 1;
+  const startIteration = isNestedWaitResume
+    ? resumeIteration
+    : isLoopResume
+      ? resumeIteration + 1
+      : recoveryIteration;
+  const sourceDigest =
+    ctx.workflowSourceRoots.kind === 'captured' ? ctx.workflowSourceRoots.anchor.digest : 'live';
+  const scopeKey = createHash('sha256').update(stepName).digest('hex').slice(0, 16);
+  const iterationPaths = (iteration: number): { artifactsDir: string; stateDir: string } => ({
+    artifactsDir: joinPath(artifactsDir, 'iterations', scopeKey, String(iteration)),
+    stateDir: joinPath(stateDir, 'iterations', workflowRun.id, scopeKey, String(iteration)),
+  });
+  const writeIterationEvent = group.iteration_worktree
+    ? deps.store.persistWorkflowEvent.bind(deps.store)
+    : deps.store.createWorkflowEvent.bind(deps.store);
+  const boundEstates = new Map<number, IterationWorktreeBinding>();
+  const bindIteration = async (
+    iteration: number
+  ): Promise<IterationWorktreeBinding | undefined> => {
+    if (!group.iteration_worktree) return undefined;
+    if (ctx.execContext.kind !== 'host')
+      throw new Error('Iteration worktrees require host execution');
+    if (!ctx.resolveIterationIsolation)
+      throw new Error(`Loop group '${node.id}' requires an iteration-isolation resolver`);
+    const cached = boundEstates.get(iteration);
+    if (cached) return cached;
+    const recorded = snapshot?.iterationWorktrees?.get(`${stepName}:${iteration}`);
+    const binding = await ctx.resolveIterationIsolation({
+      parentRun: workflowRun,
+      groupPath: stepName,
+      iteration,
+      sourceDigest,
+      ...(recorded ? { recorded } : {}),
+    });
+    if (
+      binding.groupPath !== stepName ||
+      binding.iteration !== iteration ||
+      binding.sourceDigest !== sourceDigest
+    ) {
+      throw new Error(
+        `Iteration resolver returned the wrong identity for ${stepName}:${iteration}`
+      );
+    }
+    if (!recorded) {
+      await deps.store.persistWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'iteration_worktree_bound',
+        step_name: stepName,
+        data: { ...binding },
+      });
+    }
+    const paths = iterationPaths(iteration);
+    mkdirSync(paths.artifactsDir, { recursive: true });
+    mkdirSync(paths.stateDir, { recursive: true });
+    boundEstates.set(iteration, binding);
+    return binding;
+  };
+  const pauseIterationGate = async (
+    iteration: number,
+    gate: PendingIterationGate,
+    completionDetected: boolean
+  ): Promise<boolean> => {
+    const gateMsg =
+      `⏸ **Input required** (loop_group \`${node.id}\`, iteration ${String(iteration)}): ${gate.message}\n\n` +
+      `Run ID: \`${workflowRun.id}\`\n` +
+      `Respond: \`/workflow approve ${workflowRun.id} <your feedback>\` | Cancel: \`/workflow reject ${workflowRun.id}\``;
+    const gateSent = await safeSendMessage(platform, conversationId, gateMsg, msgContext);
+    if (!gateSent) {
+      getLog().error(
+        { nodeId: node.id, workflowRunId: workflowRun.id, iteration },
+        'loop_group_node.gate_message_send_failed'
+      );
+      return false;
+    }
+    deps.store
+      .createWorkflowEvent({
+        workflow_run_id: workflowRun.id,
+        event_type: 'approval_requested',
+        step_name: stepName,
+        data: { message: gate.message, iteration, completionSignaled: completionDetected },
+      })
+      .catch((err: Error) => {
+        getLog().error(
+          { err, nodeId: node.id, iteration },
+          'loop_group_node.iteration_event_failed'
+        );
+      });
+    await pauseGateRespectingExternalTransition(deps, workflowRun.id, {
+      nodeId: node.id,
+      message: gate.message,
+      type: 'interactive_loop',
+      iteration,
+      sessionId: gate.sessionId,
+      sessionProvider: gate.sessionProvider,
+      completionSignaled: completionDetected,
+      signaledOutput: completionDetected ? gate.output : null,
+      signaledStructuredOutput: completionDetected ? (gate.structuredOutput ?? null) : null,
+    });
+    return true;
+  };
+  if (
+    !isLoopResume &&
+    group.iteration_worktree &&
+    progress !== undefined &&
+    progress.started === progress.completed &&
+    progress.completed > 0 &&
+    group.interactive &&
+    group.gate_message &&
+    progress.pendingGate
+  ) {
+    await bindIteration(progress.completed);
+    const sent = await pauseIterationGate(
+      progress.completed,
+      progress.pendingGate,
+      progress.completionDetected === true
+    );
+    return sent
+      ? {
+          state: 'completed',
+          output: progress.pendingGate.output,
+          loopIterations: progress.completed,
+        }
+      : {
+          state: 'failed',
+          output: progress.pendingGate.output,
+          error: `Loop-group gate message failed to deliver for node '${node.id}' — cannot pause safely`,
+        };
+  }
+  if (
+    !isLoopResume &&
+    group.iteration_worktree &&
+    progress !== undefined &&
+    progress.started === progress.completed &&
+    progress.completed > 0 &&
+    group.interactive &&
+    group.gate_message &&
+    !(progress.completionDetected && group.signal_completes)
+  ) {
+    throw new Error(
+      `Loop group '${node.id}' has completed iteration ${String(progress.completed)} without a recoverable gate`
+    );
+  }
+  if (
+    !isLoopResume &&
+    group.iteration_worktree &&
+    progress !== undefined &&
+    progress.started === progress.completed &&
+    progress.completed > 0 &&
+    progress.completionDetected === true &&
+    (!group.interactive || group.signal_completes)
+  ) {
+    await bindIteration(progress.completed);
+    const sink = latestBodySink();
+    const output = stripCompletionTags(sink?.output ?? '', group.until);
+    await recordNodeState({ store: deps.store, logDir }, node, {
+      workflow_run_id: workflowRun.id,
+      event_type: 'node_completed',
+      step_name: stepName,
+      data: {
+        node_output: output,
+        ...(sink?.structuredOutput !== undefined
+          ? { structured_output: sink.structuredOutput }
+          : {}),
+        aggregate: true,
+      },
+    });
+    return {
+      state: 'completed',
+      output,
+      loopIterations: progress.completed,
+      ...(sink?.structuredOutput !== undefined ? { structuredOutput: sink.structuredOutput } : {}),
+    };
+  }
   // max_iterations bounds autonomous work. An attention wait contributes no work while
   // paused, so each explicit resume authorizes one fresh iteration even after that bound.
   // This keeps manual recovery resumable without turning a concluded-red wait into polling.
@@ -4652,6 +4888,7 @@ async function executeLoopGroupNode(
   }
 
   if (isEscalatedWaitResume) {
+    await bindIteration(resumeIteration);
     const terminalNode = findLoopGroupTerminalSuspendNode(bodyNodes);
     if (terminalNode?.kind !== 'wait') {
       throw new Error(`Loop group '${node.id}' resumed with wait state but has no terminal wait`);
@@ -4669,6 +4906,10 @@ async function executeLoopGroupNode(
         iteration: resumeIteration,
         sessionId: loopOwnedWaitMeta?.sessionId ?? null,
         sessionProvider: loopOwnedWaitMeta?.sessionProvider ?? null,
+        ancestry: {
+          version: 1,
+          frames: [...ctx.loopGroupPath, { groupId: node.id, iteration: resumeIteration }],
+        },
       },
       logDir
     );
@@ -4680,6 +4921,27 @@ async function executeLoopGroupNode(
   }
 
   let loopPrevOutputs: Map<string, NodeOutput> | undefined; // undefined on iteration 1
+  if (
+    group.iteration_worktree &&
+    snapshot &&
+    (recoveryIteration > 1 || (progress !== undefined && progress.started > 1))
+  ) {
+    const previous =
+      progress && progress.started > progress.completed
+        ? snapshot.previousIterationOutputs?.get(stepName)
+        : undefined;
+    if (progress && progress.started > progress.completed && previous === undefined) {
+      throw new Error(`Loop group '${node.id}' cannot recover preceding iteration outputs`);
+    }
+    loopPrevOutputs = new Map(
+      bodyNodes.flatMap(bodyNode => {
+        const prior = previous
+          ? previous.get(bodyNode.id)
+          : snapshot.completedNodeOutputs.get(bodyStepNamePrefix + bodyNode.id);
+        return prior ? [[bodyNode.id, hydrateBodyOutput(bodyNode, prior)] as const] : [];
+      })
+    );
+  }
   // Restore the body-output snapshot $LOOP_PREV.* reads, for the resumed iteration
   // (#2748). The pause boundary discards this function's local state, but the last
   // iteration's direct body-node outputs already survive as persisted
@@ -4688,7 +4950,7 @@ async function executeLoopGroupNode(
   // sourced from getDagResumeSnapshot's #2726/#2732 bounded-rows + spill/rehydrate
   // read), keyed by that full step name. Re-key to the bare body id so
   // substituteLoopPrevRefs finds them exactly as it would mid-loop.
-  if (isLoopResume) {
+  if (isLoopResume && !isNestedWaitResume) {
     const restoredLoopPrevOutputs = new Map<string, NodeOutput>();
     const bodyNodesById = new Map(bodyNodes.map(n => [n.id, n]));
     for (const id of directBodyIds) {
@@ -4736,6 +4998,8 @@ async function executeLoopGroupNode(
     const terminalSink = terminalNode ? loopPrevOutputs.get(terminalNode.id) : undefined;
     if (terminalSink !== undefined) {
       const resumedIteration = resumeIteration;
+      const resumedEstate = await bindIteration(resumedIteration);
+      const resumedPaths = group.iteration_worktree ? iterationPaths(resumedIteration) : undefined;
       const rawIterationOutput = terminalSink.output;
       const resumedSignalDetected =
         group.until !== undefined && detectCompletionSignal(rawIterationOutput, group.until);
@@ -4751,14 +5015,14 @@ async function executeLoopGroupNode(
           group.until_bash,
           workflowRun.id,
           workflowRun.user_message,
-          artifactsDir,
+          resumedPaths?.artifactsDir ?? artifactsDir,
           baseBranch,
           docsDir,
           issueContext,
           undefined,
           undefined,
           undefined,
-          { shellSafe: true, stateDir }
+          { shellSafe: true, stateDir: resumedPaths?.stateDir ?? stateDir }
         );
         // Merge outer-DAG outputs underneath the reconstructed body outputs —
         // mirrors how a normal (non-resumed) iteration seeds scopedNodeOutputs
@@ -4772,13 +5036,13 @@ async function executeLoopGroupNode(
           resumedBashPrompt,
           resumedScope,
           true, // escapedForBash
-          artifactsDir,
+          resumedPaths?.artifactsDir ?? artifactsDir,
           { consumerId: node.id, field: 'loop_group.until_bash' }
         );
         const resumedBashPath = resolveBashPath();
         try {
           await runSubprocess(execContext, resumedBashPath, ['-c', resumedSubstitutedBash], {
-            cwd,
+            cwd: resumedEstate?.cwd ?? cwd,
             timeout: node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT,
             protectedEnvKeys: config.protectedEnvKeys,
             protectedCredentialValues: config.protectedCredentialValues,
@@ -4865,7 +5129,10 @@ async function executeLoopGroupNode(
     }
   }
 
-  let lastIterationOutput = '';
+  let lastIterationOutput =
+    !isLoopResume && group.iteration_worktree && recoveryIteration > 1
+      ? stripCompletionTags(latestBodySink()?.output ?? '', group.until)
+      : '';
   // The terminal sink's structured payload for the same iteration (#2637) — tracked
   // beside the text so the group's completed NodeOutput carries the logical value
   // (sibling `loop:` has done this since #2563; the group used to discard it).
@@ -4892,10 +5159,6 @@ async function executeLoopGroupNode(
           provider: resumedLoopSessionProvider,
         }
       : undefined;
-
-  const logEventStoreError = (err: Error, iteration: number): void => {
-    getLog().error({ err, nodeId: node.id, iteration }, 'loop_group_node.iteration_event_failed');
-  };
 
   for (let i = startIteration; i <= iterationLimit; i++) {
     const iterationStart = Date.now();
@@ -4925,16 +5188,16 @@ async function executeLoopGroupNode(
       iteration: i,
       maxIterations: iterationLimit,
     });
-    deps.store
-      .createWorkflowEvent({
+    if (!(progress?.started === i && progress.completed < i)) {
+      await writeIterationEvent({
         workflow_run_id: workflowRun.id,
         event_type: 'loop_iteration_started',
         step_name: stepName,
         data: { iteration: i, maxIterations: iterationLimit, nodeId: node.id },
-      })
-      .catch((err: Error) => {
-        logEventStoreError(err, i);
       });
+    }
+    const iterationEstate = await bindIteration(i);
+    const scopedPaths = group.iteration_worktree ? iterationPaths(i) : undefined;
 
     // Pre-substitute $LOOP_PREV.* refs and $LOOP_USER_INPUT into the body node prompt
     // fields. The body is a sealed sub-DAG whose executors build prompts from node
@@ -4949,7 +5212,7 @@ async function executeLoopGroupNode(
         n,
         prevSnapshot,
         userInputForIter,
-        artifactsDir,
+        scopedPaths?.artifactsDir ?? artifactsDir,
         knownBodyIds,
         directBodyIds
       )
@@ -4962,15 +5225,29 @@ async function executeLoopGroupNode(
     // upstream outputs so body nodes can reference outer context via $nodeId.output if
     // needed (the body is sealed against depends_on, but prompt refs remain valid).
     const scopedNodeOutputs = new Map<string, NodeOutput>(outerNodeOutputs);
+    const priorBodyNodes =
+      snapshot && progress?.started === i && progress.completed < i
+        ? new Map(
+            bodyNodes.flatMap(bodyNode => {
+              const prior = snapshot.completedNodeOutputs.get(bodyStepNamePrefix + bodyNode.id);
+              return prior ? [[bodyNode.id, prior] as const] : [];
+            })
+          )
+        : undefined;
+    for (const [id, prior] of priorBodyNodes ?? []) {
+      const definition = bodyNodes.find(bodyNode => bodyNode.id === id);
+      if (definition) scopedNodeOutputs.set(id, hydrateBodyOutput(definition, prior));
+    }
 
     const iterCtx: RunLayersContext = {
       deps: ctx.deps,
       platform: ctx.platform,
       conversationId: ctx.conversationId,
-      cwd: ctx.cwd,
+      cwd: iterationEstate?.cwd ?? ctx.cwd,
       // Forwarded for completeness — a `workflow:` node inside a loop_group body is
       // rejected at load time, so this closure is never actually invoked here.
       runChildWorkflow: ctx.runChildWorkflow,
+      resolveIterationIsolation: ctx.resolveIterationIsolation,
       workflowRun: ctx.workflowRun,
       workflowName: node.id,
       // A body node's commands and scripts come from the same frozen source as the
@@ -4992,8 +5269,8 @@ async function executeLoopGroupNode(
       workflowLevelOptions: { ...ctx.workflowLevelOptions, workflowTier },
       aiProfile: ctx.aiProfile,
       workflowPreset,
-      artifactsDir: ctx.artifactsDir,
-      stateDir: ctx.stateDir,
+      artifactsDir: scopedPaths?.artifactsDir ?? ctx.artifactsDir,
+      stateDir: scopedPaths?.stateDir ?? ctx.stateDir,
       logDir: ctx.logDir,
       baseBranch: ctx.baseBranch,
       docsDir: ctx.docsDir,
@@ -5012,14 +5289,17 @@ async function executeLoopGroupNode(
       scopeArtifactsDir: undefined,
       layers: iterBodyLayers,
       nodeOutputs: scopedNodeOutputs,
-      priorCompletedNodes: undefined, // body re-runs in full each iteration (v1)
+      priorCompletedNodes: priorBodyNodes,
       claimedWorkPausePolicy: ctx.claimedWorkPausePolicy,
       // Thread the loop-level session cursor: fresh_context (or the loop's true first
       // iteration) starts fresh; otherwise carry the prior iteration's last sequential
       // session forward so a body AI node resumes the prior iteration's conversation.
       // Gate on the literal i === 1 (not startIteration): on interactive resume the
       // first processed iteration must continue the restored pre-pause session.
-      lastSequentialSession: group.fresh_context || i === 1 ? undefined : loopLastSequentialSession,
+      lastSequentialSession:
+        group.iteration_worktree || group.fresh_context || i === 1
+          ? undefined
+          : loopLastSequentialSession,
       warnedProviderConflicts: ctx.warnedProviderConflicts,
       totalCostUsd: 0,
       totalTokens: undefined,
@@ -5059,6 +5339,31 @@ async function executeLoopGroupNode(
         [...(loopTotalTokens !== undefined ? [loopTotalTokens] : []), iterCtx.totalTokens],
         { nodeId: node.id, iteration: i }
       );
+    }
+
+    if (postBodyStatus === 'paused') {
+      const pausedRun = await deps.store.getWorkflowRun(workflowRun.id);
+      const pausedWait = isWorkflowWaitContext(pausedRun?.metadata?.wait)
+        ? pausedRun.metadata.wait
+        : undefined;
+      const frames = pausedWait?.owner === 'loop_group' ? pausedWait.ancestry?.frames : undefined;
+      const currentPath = [...ctx.loopGroupPath, { groupId: node.id, iteration: i }];
+      if (
+        frames &&
+        frames.length > currentPath.length &&
+        currentPath.every(
+          (frame, index) =>
+            frames[index]?.groupId === frame.groupId && frames[index]?.iteration === frame.iteration
+        )
+      ) {
+        return {
+          state: 'completed',
+          output: lastIterationOutput,
+          costUsd: loopTotalCostUsd,
+          ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+          loopIterations: i,
+        };
+      }
     }
 
     // #2707 step 3: pause escalation. A gate node that is the body's sole terminal
@@ -5228,24 +5533,24 @@ async function executeLoopGroupNode(
           prevResolvedBash,
           workflowRun.id,
           workflowRun.user_message,
-          artifactsDir,
+          scopedPaths?.artifactsDir ?? artifactsDir,
           baseBranch,
           docsDir,
           issueContext,
           i === startIteration ? loopUserInput : undefined,
           undefined,
           undefined,
-          { shellSafe: true, stateDir }
+          { shellSafe: true, stateDir: scopedPaths?.stateDir ?? stateDir }
         );
         const substitutedBash = substituteNodeOutputRefs(
           bashPrompt,
           scopedNodeOutputs,
           true, // escapedForBash
-          artifactsDir,
+          scopedPaths?.artifactsDir ?? artifactsDir,
           { consumerId: node.id, field: 'loop_group.until_bash' }
         );
         await runSubprocess(execContext, groupBashPath, ['-c', substitutedBash], {
-          cwd,
+          cwd: iterationEstate?.cwd ?? cwd,
           timeout: node.timeout ?? SUBPROCESS_DEFAULT_TIMEOUT,
           protectedEnvKeys: config.protectedEnvKeys,
           protectedCredentialValues: config.protectedCredentialValues,
@@ -5315,6 +5620,26 @@ async function executeLoopGroupNode(
 
     const duration = Date.now() - iterationStart;
     const completionDetected = completionChecks.some(check => check.completed);
+    const interactiveFirstRun = group.interactive && !isLoopResume;
+    const signalCompletes = group.signal_completes === true;
+    const pendingGate: PendingIterationGate | undefined =
+      group.interactive &&
+      group.gate_message &&
+      !(completionDetected && (!interactiveFirstRun || signalCompletes))
+        ? {
+            message: buildHonestGateMessage(
+              completionChecks,
+              lastIterationOutput,
+              group.gate_message
+            ),
+            output: lastIterationOutput,
+            ...(lastIterationStructuredOutput !== undefined
+              ? { structuredOutput: lastIterationStructuredOutput }
+              : {}),
+            sessionId: loopLastSequentialSession?.sessionId ?? null,
+            sessionProvider: loopLastSequentialSession?.provider ?? null,
+          }
+        : undefined;
 
     getWorkflowEventEmitter().emit({
       type: 'loop_iteration_completed',
@@ -5324,22 +5649,22 @@ async function executeLoopGroupNode(
       duration,
       completionDetected,
     });
-    deps.store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRun.id,
-        event_type: 'loop_iteration_completed',
-        step_name: stepName,
-        data: { iteration: i, duration, completionDetected, nodeId: node.id },
-      })
-      .catch((err: Error) => {
-        logEventStoreError(err, i);
-      });
+    await writeIterationEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'loop_iteration_completed',
+      step_name: stepName,
+      data: {
+        iteration: i,
+        duration,
+        completionDetected,
+        nodeId: node.id,
+        ...(group.iteration_worktree && pendingGate ? { pendingGate } : {}),
+      },
+    });
 
     // Completion: honor the completed iteration only when the AI had input to evaluate (interactive
     // first run always gates first — mirrors executeLoopNode's interactiveFirstRun),
     // UNLESS the author opted into autonomous completion via signal_completes (#2074).
-    const interactiveFirstRun = group.interactive && !isLoopResume;
-    const signalCompletes = group.signal_completes === true;
     if (completionDetected && (!interactiveFirstRun || signalCompletes)) {
       await safeSendMessage(
         platform,
@@ -5401,64 +5726,14 @@ async function executeLoopGroupNode(
     // Interactive gate — pause after an iteration that did not complete (or, when
     // interactiveFirstRun && !signalCompletes, an iteration that DID complete — the honest
     // status line + persisted completion state (#2074) let a bare approve finalize it).
-    if (group.interactive && group.gate_message) {
-      const honestMessage = buildHonestGateMessage(
-        completionChecks,
-        lastIterationOutput,
-        group.gate_message
-      );
-      const gateMsg =
-        `⏸ **Input required** (loop_group \`${node.id}\`, iteration ${String(i)}): ${honestMessage}\n\n` +
-        `Run ID: \`${workflowRun.id}\`\n` +
-        `Respond: \`/workflow approve ${workflowRun.id} <your feedback>\` | Cancel: \`/workflow reject ${workflowRun.id}\``;
-      const gateSent = await safeSendMessage(platform, conversationId, gateMsg, {
-        workflowId: workflowRun.id,
-        nodeName: node.id,
-      });
-      if (!gateSent) {
-        getLog().error(
-          { nodeId: node.id, workflowRunId: workflowRun.id, iteration: i },
-          'loop_group_node.gate_message_send_failed'
-        );
+    if (pendingGate) {
+      if (!(await pauseIterationGate(i, pendingGate, completionDetected))) {
         return {
           state: 'failed',
           output: lastIterationOutput,
           error: `Loop-group gate message failed to deliver for node '${node.id}' — cannot pause safely`,
         };
       }
-      deps.store
-        .createWorkflowEvent({
-          workflow_run_id: workflowRun.id,
-          event_type: 'approval_requested',
-          step_name: stepName,
-          data: { message: honestMessage, iteration: i, completionSignaled: completionDetected },
-        })
-        .catch((err: Error) => {
-          logEventStoreError(err, i);
-        });
-      await pauseGateRespectingExternalTransition(deps, workflowRun.id, {
-        nodeId: node.id,
-        message: honestMessage,
-        type: 'interactive_loop',
-        iteration: i,
-        // Persist the body's session cursor so a resumed fresh_context: false loop
-        // continues the pre-pause conversation (restored into the cursor on resume).
-        // The provider tag rides along so the restore never threads the session into
-        // a different provider (#1992). null = this pause has no cursor to restore.
-        sessionId: loopLastSequentialSession?.sessionId ?? null,
-        sessionProvider: loopLastSequentialSession?.provider ?? null,
-        // Signal state for finalize-on-bare-approve (#2074). The structured payload
-        // rides along (#2637) so the finalize attaches it like a natural completion.
-        completionSignaled: completionDetected,
-        signaledOutput: completionDetected ? lastIterationOutput : null,
-        signaledStructuredOutput: completionDetected
-          ? (lastIterationStructuredOutput ?? null)
-          : null,
-        // NO `signaledTokens` — a loop_group gate has no consumer for it. The body's
-        // own `<groupId>.<nodeId>` rows already persisted this iteration's usage before
-        // the pause, so the finalize path deliberately writes no `tokens` (see the
-        // finalizeLoopFromSignal call above). Only the plain `loop` gate carries it.
-      });
       return {
         state: 'completed',
         output: lastIterationOutput,
@@ -7161,6 +7436,7 @@ interface WaitLoopOwner {
   iteration: number;
   sessionId: string | null;
   sessionProvider: string | null;
+  ancestry?: NonNullable<Extract<WorkflowWaitContext, { owner: 'loop_group' }>['ancestry']>;
 }
 
 async function executeWaitNode(
@@ -7183,7 +7459,10 @@ async function executeWaitNode(
       : rawPersisted.owner === 'loop_group' &&
         rawPersisted.nodeId === loopOwner.groupId &&
         rawPersisted.bodyWaitId === node.id &&
-        rawPersisted.iteration === loopOwner.iteration)
+        rawPersisted.iteration === loopOwner.iteration &&
+        (rawPersisted.ancestry === undefined
+          ? loopOwner.ancestry?.frames.length === 1
+          : JSON.stringify(rawPersisted.ancestry) === JSON.stringify(loopOwner.ancestry)))
       ? rawPersisted
       : undefined;
 
@@ -7197,6 +7476,7 @@ async function executeWaitNode(
           iteration: loopOwner.iteration,
           sessionId: loopOwner.sessionId,
           sessionProvider: loopOwner.sessionProvider,
+          ...(loopOwner.ancestry ? { ancestry: loopOwner.ancestry } : {}),
         } as const);
   const condition = waitCondition(node.wait);
   let context: WorkflowWaitContext;
@@ -9372,6 +9652,7 @@ interface RunInputs {
    * loop_group body is rejected at load time.
    */
   runChildWorkflow?: RunChildWorkflowFn;
+  resolveIterationIsolation?: IterationIsolationResolver['resolve'];
   workflowRun: WorkflowRun;
   config: WorkflowConfig;
   workflowProvider: string;
@@ -10186,6 +10467,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                         iteration: loopFrame.iteration,
                         sessionId: ctx.lastSequentialSession?.sessionId ?? null,
                         sessionProvider: ctx.lastSequentialSession?.provider ?? null,
+                        ancestry: { version: 1, frames: ctx.loopGroupPath },
                       },
                   ctx.logDir
                 );
@@ -11331,6 +11613,7 @@ export async function executeDagWorkflow(
     execContext = { kind: 'host' },
     containerCtx,
     runChildWorkflow,
+    resolveIterationIsolation,
     priorUsage,
     priorNodeSessions,
     workflowSourceRoots,
@@ -11555,6 +11838,7 @@ export async function executeDagWorkflow(
     cwd,
     execContext,
     runChildWorkflow,
+    resolveIterationIsolation,
     workflowRun,
     workflowName: workflow.name,
     workflowSourceRoots: workflowSourceRoots ?? liveSourceRoots(cwd),

@@ -116,6 +116,12 @@
       "src/db/workflows.resume-cas.integration.test.ts"
     ],
     [
+      "src/db/release-claims.integration.test.ts"
+    ],
+    [
+      "src/db/release-claims.postgres.integration.test.ts"
+    ],
+    [
       "src/db/workflow-events.since.integration.test.ts"
     ],
     [
@@ -151,6 +157,9 @@
     [
       "src/workflows/store-adapter.test.ts",
       "src/workflows/child-isolation-resolver.test.ts"
+    ],
+    [
+      "src/workflows/iteration-isolation-resolver.integration.test.ts"
     ],
     [
       "src/workflows/resolve-run-workflow.test.ts"
