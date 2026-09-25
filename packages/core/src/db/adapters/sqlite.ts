@@ -773,6 +773,27 @@ export class SqliteAdapter implements IDatabase {
         output_root TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS remote_agent_release_claims (
+        id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        issue_key TEXT NOT NULL,
+        owner_run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id),
+        scope_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('claimed', 'merged', 'deployed', 'released')),
+        pr_number INTEGER,
+        head_sha TEXT,
+        merge_commit TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS unique_active_release_issue
+        ON remote_agent_release_claims (repository, issue_key)
+        WHERE state IN ('claimed', 'merged', 'deployed');
+
+      CREATE UNIQUE INDEX IF NOT EXISTS unique_release_issue_owner
+        ON remote_agent_release_claims (repository, issue_key, owner_run_id);
+
       -- Workflow events table
       CREATE TABLE IF NOT EXISTS remote_agent_workflow_events (
         id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),

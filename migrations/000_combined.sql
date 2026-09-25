@@ -8,7 +8,7 @@
 --     COMMENT ON COLUMN — goes in the final "Indexes and column comments"
 --     section, below every ADD COLUMN.
 --
--- 14 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
+-- 15 Tables (+ the remote_agent_auth_* Better Auth tables, listed inline below):
 --   1. remote_agent_codebases
 --   1b. remote_agent_codebase_env_vars
 --   1c. remote_agent_users
@@ -17,6 +17,7 @@
 --   3. remote_agent_sessions
 --   4. remote_agent_isolation_environments
 --   5. remote_agent_workflow_runs
+--   5b. remote_agent_release_claims
 --   6. remote_agent_workflow_events
 --   6b. remote_agent_workflow_node_sessions
 --   7. remote_agent_messages
@@ -202,6 +203,20 @@ CREATE TABLE IF NOT EXISTS remote_agent_workflow_runs (
 
 COMMENT ON TABLE remote_agent_workflow_runs IS
   'Tracks workflow execution state for resumption and observability';
+
+CREATE TABLE IF NOT EXISTS remote_agent_release_claims (
+  id UUID PRIMARY KEY,
+  repository TEXT NOT NULL,
+  issue_key TEXT NOT NULL,
+  owner_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id),
+  scope_digest TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('claimed', 'merged', 'deployed', 'released')),
+  pr_number INTEGER,
+  head_sha TEXT,
+  merge_commit TEXT,
+  created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
 
 -- ============================================================================
 -- Table 6: Workflow Events
@@ -690,6 +705,12 @@ CREATE INDEX IF NOT EXISTS idx_workflow_runs_adopted_from
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_last_activity
   ON remote_agent_workflow_runs(last_activity_at)
   WHERE status = 'running';
+
+CREATE UNIQUE INDEX IF NOT EXISTS unique_active_release_issue
+  ON remote_agent_release_claims (repository, issue_key)
+  WHERE state IN ('claimed', 'merged', 'deployed');
+CREATE UNIQUE INDEX IF NOT EXISTS unique_release_issue_owner
+  ON remote_agent_release_claims (repository, issue_key, owner_run_id);
 
 -- Workflow events
 CREATE INDEX IF NOT EXISTS idx_workflow_events_run_id
