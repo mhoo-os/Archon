@@ -1,0 +1,33 @@
+name: Mhoo AI review
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Open PR number to review
+        required: true
+        type: string
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+concurrency:
+  group: mhoo-ai-review-${{ github.event.pull_request.number || inputs.pr_number }}
+  cancel-in-progress: false
+jobs:
+  review:
+    if: github.repository_owner == 'mhoo-os' && github.event.pull_request.draft != true
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Fetch pinned reviewer (no PR checkout)
+        env:
+          RUNNER_HASH: 29ac52f28e74405a481ecd45184622fb3efab265acc364e4c1eb8d659d24285a
+        run: |
+          curl --fail --silent --show-error --max-time 30 --proto '=https' 'https://mhoo-ai-review.mhoo-app.workers.dev/runner/29ac52f28e74405a481ecd45184622fb3efab265acc364e4c1eb8d659d24285a.mjs' -o "$RUNNER_TEMP/mhoo-review.mjs"
+          echo "$RUNNER_HASH  $RUNNER_TEMP/mhoo-review.mjs" | sha256sum --check --status
+      - name: Review current PR head and update comment
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node "$RUNNER_TEMP/mhoo-review.mjs"
