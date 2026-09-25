@@ -20,7 +20,9 @@ import type {
 import type { TokenUsage } from '@archon/providers/types';
 import type { FanOutInstanceSnapshot } from './fan-out-identity';
 import type { IterationWorktreeBinding } from './child-isolation';
+import { z } from 'zod';
 export type { IterationWorktreeBinding } from './child-isolation';
+export { iterationWorktreeBindingSchema } from './child-isolation';
 
 export type { WorkflowNodeSession, WorkflowRunNodeSession } from './schemas';
 
@@ -45,6 +47,8 @@ export interface PersistedNodeOutput {
 
 export interface DagResumeSnapshot {
   completedNodeOutputs: Map<string, PersistedNodeOutput>;
+  /** Direct body outputs from the iteration before the active one, keyed by group path. */
+  previousIterationOutputs?: Map<string, Map<string, PersistedNodeOutput>>;
   /** First durable ordered snapshot for each instance-qualified composed fan-out scope. */
   fanOutSnapshots: Map<string, readonly FanOutInstanceSnapshot[]>;
   iterationWorktrees?: Map<string, IterationWorktreeBinding>;
@@ -60,7 +64,18 @@ export interface LoopIterationProgress {
   started: number;
   completed: number;
   completionDetected?: boolean;
+  pendingGate?: PendingIterationGate;
 }
+
+export const pendingIterationGateSchema = z.object({
+  message: z.string(),
+  output: z.string(),
+  structuredOutput: z.unknown().optional(),
+  sessionId: z.string().nullable(),
+  sessionProvider: z.string().nullable(),
+});
+
+export type PendingIterationGate = z.infer<typeof pendingIterationGateSchema>;
 
 /** Durable wait outcome committed atomically with consumption of its active cursor. */
 export interface WorkflowWaitCompletion {

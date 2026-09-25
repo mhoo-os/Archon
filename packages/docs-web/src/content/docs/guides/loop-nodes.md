@@ -788,8 +788,12 @@ Two distinct cases:
   the persisted run history — the same as an un-paused next iteration would
   have seen.
 - **Failure resume** (`/workflow resume <id>` after a crash/failure): there is
-  no persisted iteration cursor — the loop_group node restarts from
-  **iteration 1**. Per-body-node resume granularity is not supported in v1.
+  no persisted iteration cursor for an ordinary `loop_group`: it restarts from
+  **iteration 1** and reruns the body. With `iteration_worktree: true`, the
+  recorded iteration and its checkout are reattached. Completed body nodes in
+  that iteration are reused, and `$LOOP_PREV.*` reads the preceding iteration's
+  recorded outputs. A missing or ambiguous checkout stops recovery for operator
+  inspection.
 
 ### What is NOT supported on loop_group nodes (v1)
 
@@ -800,12 +804,12 @@ Two distinct cases:
 - `retry` (the loop manages its own iteration) — rejected at parse time.
 - `persist_session` for body AI nodes across iterations — body sessions reset
   per iteration (governed by `fresh_context`).
-- Per-body-node resume (skip-to-failed-body-node) — the whole iteration re-runs.
+- Per-body-node resume in an ordinary `loop_group` — the whole iteration re-runs.
 - `$LOOP_PREV.<id>.output[N]` history indexing — only the immediately prior
   iteration is reachable.
 
-Nested `loop_group` inside a `loop_group` body is supported by construction
-(the body is a normal `nodes` array), but is not hardened in v1.
+Nested `loop_group` bodies can resume through a single active native wait path.
+Nested `iteration_worktree` scopes are rejected during validation.
 
 ## See Also
 

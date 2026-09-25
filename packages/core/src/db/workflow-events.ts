@@ -21,6 +21,8 @@ import {
   type NodeStateEventType,
   type NodeLifecycleEventType,
   type DagResumeSnapshot,
+  pendingIterationGateSchema,
+  iterationWorktreeBindingSchema,
   type IterationWorktreeBinding,
   type LoopIterationProgress,
   type PersistedNodeOutput,
@@ -431,6 +433,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
     ]
   );
   const completedNodeOutputs = new Map<string, PersistedNodeOutput>();
+  const previousIterationOutputs = new Map<string, Map<string, PersistedNodeOutput>>();
   const fanOutSnapshots = new Map<string, readonly FanOutInstanceSnapshot[]>();
   const iterationWorktrees = new Map<string, IterationWorktreeBinding>();
   const loopIterationProgress = new Map<string, LoopIterationProgress>();
@@ -478,6 +481,12 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
         completed: prior.completed,
       });
       const prefix = `${row.step_name}.`;
+      const previous = new Map<string, PersistedNodeOutput>();
+      for (const [key, output] of completedNodeOutputs) {
+        const bodyId = key.startsWith(prefix) ? key.slice(prefix.length) : '';
+        if (bodyId && !bodyId.includes('.')) previous.set(bodyId, output);
+      }
+      previousIterationOutputs.set(row.step_name, previous);
       for (const key of loopIterationProgress.keys()) {
         if (key.startsWith(prefix)) loopIterationProgress.delete(key);
       }
@@ -499,28 +508,23 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
         ...(typeof data.completionDetected === 'boolean'
           ? { completionDetected: data.completionDetected }
           : {}),
+        ...(data.pendingGate !== undefined
+          ? { pendingGate: pendingIterationGateSchema.parse(data.pendingGate) }
+          : {}),
       });
       continue;
     }
     if (row.event_type === 'iteration_worktree_bound') {
-      const binding = data as Partial<IterationWorktreeBinding>;
-      if (
-        binding.groupPath !== row.step_name ||
-        typeof binding.iteration !== 'number' ||
-        typeof binding.cwd !== 'string' ||
-        typeof binding.branchName !== 'string' ||
-        typeof binding.envId !== 'string' ||
-        typeof binding.baseSha !== 'string' ||
-        typeof binding.targetRef !== 'string' ||
-        typeof binding.sourceDigest !== 'string'
-      )
+      const parsed = iterationWorktreeBindingSchema.safeParse(data);
+      if (!parsed.success || parsed.data.groupPath !== row.step_name)
         throw new Error(`Invalid iteration worktree binding for ${row.step_name}`);
+      const binding = parsed.data;
       const key = `${binding.groupPath}:${binding.iteration}`;
       const previous = iterationWorktrees.get(key);
       if (previous && JSON.stringify(previous) !== JSON.stringify(binding)) {
         throw new Error(`Conflicting iteration worktree bindings for ${key}`);
       }
-      iterationWorktrees.set(key, binding as IterationWorktreeBinding);
+      iterationWorktrees.set(key, binding);
       continue;
     }
     if (
@@ -694,6 +698,7 @@ export async function getDagResumeSnapshot(workflowRunId: string): Promise<DagRe
   );
   return {
     completedNodeOutputs,
+    previousIterationOutputs,
     fanOutSnapshots,
     iterationWorktrees,
     loopIterationProgress,

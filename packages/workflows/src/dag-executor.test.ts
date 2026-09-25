@@ -32672,6 +32672,343 @@ describe('nested durable loop wait', () => {
     await removeTempTree(testDir);
   });
 
+  it('stops before body effects when the iteration binding cannot be persisted', async () => {
+    const marker = join(testDir, 'body-ran');
+    const store = createMockStore();
+    const persist = store.persistWorkflowEvent;
+    store.persistWorkflowEvent = mock(async event => {
+      if (event.event_type === 'iteration_worktree_bound') throw new Error('event insert failed');
+      await persist(event);
+    });
+    const workflow = ready({
+      name: 'binding-write-failure',
+      description: 'binding durability',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'issues',
+          loop_group: {
+            iteration_worktree: true,
+            max_iterations: 1,
+            until: 'DONE',
+            nodes: [{ id: 'body', bash: `touch ${JSON.stringify(marker)}; echo DONE` }],
+          },
+        }),
+      ],
+    });
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun('binding-write-failure'),
+        resolveIterationIsolation: async req => ({
+          groupPath: req.groupPath,
+          iteration: req.iteration,
+          cwd: testDir,
+          branchName: 'issue-a',
+          envId: 'env-a',
+          baseSha: 'a'.repeat(40),
+          targetRef: 'dev',
+          sourceDigest: req.sourceDigest,
+        }),
+      })
+    );
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('stops before estate creation when the iteration start cannot be persisted', async () => {
+    const store = createMockStore();
+    const persist = store.persistWorkflowEvent;
+    store.persistWorkflowEvent = mock(async event => {
+      if (event.event_type === 'loop_iteration_started') throw new Error('event insert failed');
+      await persist(event);
+    });
+    const resolveIterationIsolation = mock<IterationIsolationResolver['resolve']>(async req => ({
+      groupPath: req.groupPath,
+      iteration: req.iteration,
+      cwd: testDir,
+      branchName: 'issue-a',
+      envId: 'env-a',
+      baseSha: 'a'.repeat(40),
+      targetRef: 'dev',
+      sourceDigest: req.sourceDigest,
+    }));
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: ready({
+          name: 'start-write-failure',
+          description: 'start durability',
+          nodes: [
+            dagNodeSchema.parse({
+              id: 'issues',
+              loop_group: {
+                iteration_worktree: true,
+                max_iterations: 1,
+                until: 'DONE',
+                nodes: [{ id: 'body', bash: 'echo DONE' }],
+              },
+            }),
+          ],
+        }),
+        workflowRun: makeWorkflowRun('start-write-failure'),
+        resolveIterationIsolation,
+      })
+    );
+    expect(resolveIterationIsolation).not.toHaveBeenCalled();
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+  });
+
+  it('does not advance after an iteration completion write fails', async () => {
+    const store = createMockStore();
+    const persist = store.persistWorkflowEvent;
+    store.persistWorkflowEvent = mock(async event => {
+      if (event.event_type === 'loop_iteration_completed') throw new Error('event insert failed');
+      await persist(event);
+    });
+    const resolveIterationIsolation = mock<IterationIsolationResolver['resolve']>(async req => ({
+      groupPath: req.groupPath,
+      iteration: req.iteration,
+      cwd: testDir,
+      branchName: `issue-${req.iteration}`,
+      envId: `env-${req.iteration}`,
+      baseSha: 'a'.repeat(40),
+      targetRef: 'dev',
+      sourceDigest: req.sourceDigest,
+    }));
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: ready({
+          name: 'completion-write-failure',
+          description: 'completion durability',
+          nodes: [
+            dagNodeSchema.parse({
+              id: 'issues',
+              loop_group: {
+                iteration_worktree: true,
+                max_iterations: 2,
+                until: 'DONE',
+                nodes: [{ id: 'body', bash: 'echo NEXT' }],
+              },
+            }),
+          ],
+        }),
+        workflowRun: makeWorkflowRun('completion-write-failure'),
+        resolveIterationIsolation,
+      })
+    );
+    expect(resolveIterationIsolation).toHaveBeenCalledTimes(1);
+    expect(store.failWorkflowRun).toHaveBeenCalled();
+    expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('uses A outputs after a persisted B start while reusing B successes', async () => {
+    const store = createMockStore();
+    const marker = join(testDir, 'first-reran');
+    const binding: IterationWorktreeBinding = {
+      groupPath: 'issues',
+      iteration: 2,
+      cwd: testDir,
+      branchName: 'issue-b',
+      envId: 'env-b',
+      baseSha: 'b'.repeat(40),
+      targetRef: 'dev',
+      sourceDigest: 'live',
+    };
+    (store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>).mockResolvedValue({
+      completedNodeOutputs: new Map([['issues.first', { output: 'B1' }]]),
+      previousIterationOutputs: new Map([
+        [
+          'issues',
+          new Map([
+            ['first', { output: 'A1' }],
+            ['second', { output: 'A2' }],
+          ]),
+        ],
+      ]),
+      fanOutSnapshots: new Map(),
+      unresolvedNodeStarts: new Set(),
+      costUsd: 0,
+      iterationWorktrees: new Map([['issues:2', binding]]),
+      loopIterationProgress: new Map([['issues', { started: 2, completed: 1 }]]),
+    });
+    const workflow = ready({
+      name: 'b-start-recovery',
+      description: 'previous iteration output recovery',
+      nodes: [
+        dagNodeSchema.parse({
+          id: 'issues',
+          loop_group: {
+            iteration_worktree: true,
+            max_iterations: 2,
+            until: 'DONE',
+            nodes: [
+              { id: 'first', bash: `touch ${JSON.stringify(marker)}; echo reran` },
+              {
+                id: 'second',
+                depends_on: ['first'],
+                bash: 'test $LOOP_PREV.first.output = A1; test $LOOP_PREV.second.output = A2; test $first.output = B1; echo DONE',
+              },
+            ],
+          },
+        }),
+      ],
+    });
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow,
+        workflowRun: makeWorkflowRun('b-start-recovery'),
+        resolveIterationIsolation: async req => {
+          expect(req.recorded).toEqual(binding);
+          return binding;
+        },
+      })
+    );
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(store.completeWorkflowRun).toHaveBeenCalledTimes(1);
+    expect(
+      persistedEvents(store).some(
+        event =>
+          event.event_type === 'node_completed' &&
+          event.step_name === 'issues.second' &&
+          event.data?.node_output === 'DONE'
+      )
+    ).toBe(true);
+  });
+
+  it('persists an interactive gate obligation with iteration completion', async () => {
+    const store = createEscalationStore('gate-start');
+    await executeDagWorkflow(
+      dagOptions({
+        deps: createMockDeps(store),
+        cwd: testDir,
+        workflow: ready({
+          name: 'gate-start',
+          description: 'durable gate obligation',
+          nodes: [
+            dagNodeSchema.parse({
+              id: 'issues',
+              loop_group: {
+                iteration_worktree: true,
+                max_iterations: 1,
+                interactive: true,
+                gate_message: 'Continue?',
+                until: 'DONE',
+                nodes: [{ id: 'body', bash: 'echo DONE' }],
+              },
+            }),
+          ],
+        }),
+        workflowRun: makeWorkflowRun('gate-start'),
+        resolveIterationIsolation: async req => ({
+          groupPath: req.groupPath,
+          iteration: req.iteration,
+          cwd: testDir,
+          branchName: 'issue-a',
+          envId: 'env-a',
+          baseSha: 'a'.repeat(40),
+          targetRef: 'dev',
+          sourceDigest: req.sourceDigest,
+        }),
+      })
+    );
+    expect(
+      persistedEvents(store).find(event => event.event_type === 'loop_iteration_completed')?.data
+    ).toMatchObject({
+      iteration: 1,
+      completionDetected: true,
+      pendingGate: { message: expect.any(String), output: 'DONE' },
+    });
+    expect(store.getState().status).toBe('paused');
+  });
+
+  for (const completionDetected of [true, false]) {
+    it(`recovers the pending interactive gate after completion (${String(completionDetected)})`, async () => {
+      const marker = join(testDir, 'body-ran');
+      const store = createEscalationStore('gate-recovery');
+      const binding: IterationWorktreeBinding = {
+        groupPath: 'issues',
+        iteration: 1,
+        cwd: testDir,
+        branchName: 'issue-a',
+        envId: 'env-a',
+        baseSha: 'a'.repeat(40),
+        targetRef: 'dev',
+        sourceDigest: 'live',
+      };
+      const output = completionDetected ? 'DONE' : 'NEXT';
+      (
+        store.getDagResumeSnapshot as Mock<IWorkflowStore['getDagResumeSnapshot']>
+      ).mockResolvedValue({
+        completedNodeOutputs: new Map([['issues.body', { output }]]),
+        fanOutSnapshots: new Map(),
+        unresolvedNodeStarts: new Set(),
+        costUsd: 0,
+        iterationWorktrees: new Map([['issues:1', binding]]),
+        loopIterationProgress: new Map([
+          [
+            'issues',
+            {
+              started: 1,
+              completed: 1,
+              completionDetected,
+              pendingGate: {
+                message: 'Continue?',
+                output,
+                sessionId: 'session-a',
+                sessionProvider: 'codex',
+              },
+            },
+          ],
+        ]),
+      });
+      const workflow = ready({
+        name: 'gate-recovery',
+        description: 'gate recovery',
+        nodes: [
+          dagNodeSchema.parse({
+            id: 'issues',
+            loop_group: {
+              iteration_worktree: true,
+              max_iterations: 1,
+              interactive: true,
+              gate_message: 'Continue?',
+              until: 'DONE',
+              nodes: [{ id: 'body', bash: `touch ${JSON.stringify(marker)}; echo ${output}` }],
+            },
+          }),
+        ],
+      });
+      await executeDagWorkflow(
+        dagOptions({
+          deps: createMockDeps(store),
+          cwd: testDir,
+          workflow,
+          workflowRun: makeWorkflowRun('gate-recovery'),
+          resolveIterationIsolation: async req => {
+            expect(req.recorded).toEqual(binding);
+            return binding;
+          },
+        })
+      );
+      expect(await Bun.file(marker).exists()).toBe(false);
+      expect(store.getState().status).toBe('paused');
+      expect(store.getState().metadata.approval).toMatchObject({
+        iteration: 1,
+        completionSignaled: completionDetected,
+        sessionId: 'session-a',
+      });
+      expect(store.completeWorkflowRun).not.toHaveBeenCalled();
+    });
+  }
+
   it('continues at B with the prior iteration output after a completed A event', async () => {
     const store = createMockStore();
     const recorded: IterationWorktreeBinding = {
@@ -33037,6 +33374,7 @@ describe('nested durable loop wait', () => {
           { output: '{"state":"pending"}', structuredOutput: { state: 'pending' } },
         ],
       ]),
+      previousIterationOutputs: new Map([['issues', new Map([['prepare', { output: 'GO' }]])]]),
       fanOutSnapshots: new Map(),
       unresolvedNodeStarts: new Set(),
       costUsd: 0,

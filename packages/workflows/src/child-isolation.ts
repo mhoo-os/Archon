@@ -17,6 +17,7 @@
  */
 
 import type { WorkflowRun } from './schemas';
+import { z } from 'zod';
 
 /**
  * Request for a per-child isolated checkout, built by the engine at child-spawn
@@ -66,16 +67,18 @@ export interface ChildIsolationResolver {
   resolveIteration?: IterationIsolationResolver['resolve'];
 }
 
-export interface IterationWorktreeBinding {
-  groupPath: string;
-  iteration: number;
-  cwd: string;
-  branchName: string;
-  envId: string;
-  baseSha: string;
-  targetRef: string;
-  sourceDigest: string;
-}
+export const iterationWorktreeBindingSchema = z.object({
+  groupPath: z.string(),
+  iteration: z.number().int().positive(),
+  cwd: z.string(),
+  branchName: z.string(),
+  envId: z.string(),
+  baseSha: z.string(),
+  targetRef: z.string(),
+  sourceDigest: z.string(),
+});
+
+export type IterationWorktreeBinding = z.infer<typeof iterationWorktreeBindingSchema>;
 
 export interface IterationIsolationResolver {
   resolve(req: {
